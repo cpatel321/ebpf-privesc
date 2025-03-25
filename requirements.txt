@@ -1,0 +1,11 @@
+bcc==0.1.10
+exceptiongroup==1.2.2
+iniconfig==2.1.0
+numpy==2.2.4
+packaging==24.2
+pluggy==1.5.0
+prometheus_client==0.21.1
+pytest==8.3.5
+tomli==2.2.1
+traitlets==5.14.3
+traittypes==0.2.1
