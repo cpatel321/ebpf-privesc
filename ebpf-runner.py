@@ -1,71 +1,63 @@
-#!/usr/bin/env python3
-
+from collections import defaultdict
+from datetime import datetime
+import time
 from bcc import BPF
 from pathlib import Path
-from prometheus_client import start_http_server, Counter
-import ctypes as ct
+from prometheus_client import start_http_server, Counter, Gauge
 
-# Initialize Prometheus metrics
-sys_clone_counter = Counter('sys_clone_calls_total', 'Number of sys_clone calls')
-sys_openat_counter = Counter('sys_openat_calls_total', 'Number of sys_openat calls')
-anomaly_counter = Counter('open_anomalies_total', 'Open rate anomalies detected')
+# Metrics
+sys_clone_counter = Counter('sys_clone_calls_total', 'Number of sudo process spawns')
+sys_open_counter = Counter('sys_openat_success_total', 'Number of successful sudo file opens')
+sys_open_failed = Counter('sys_openat_failed_total', 'Number of failed sudo file opens')
+sudo_anomalies = Gauge('sudo_anomalies', 'Detected sudo anomalies')
 
-start_http_server(3000)
-
-# Define C structures for map access
-class comm_key(ct.Structure):
-    _fields_ = [("comm", ct.c_char * 16)]  # TASK_COMM_LEN = 16
-
-class Config(ct.Structure):
-    _fields_ = [("window_ns", ct.c_ulonglong),
-                ("threshold", ct.c_ulonglong)]
+# Anomaly detection config
+FAILURE_THRESHOLD = 3
+TIME_WINDOW = 60  # seconds
+failed_attempts = defaultdict(lambda: {'count': 0, 'first_ts': 0})
 
 def process_clone_event(cpu, data, size):
     event = bpf["clone_events"].event(data)
-    print(f"Process {event.comm.decode()} (PID: {event.pid}, PPID: {event.ppid}) called sys_clone")
+    print(f"Sudo process spawned: {event.comm.decode()} (PID: {event.pid})")
     sys_clone_counter.inc()
 
 def process_open_event(cpu, data, size):
     event = bpf["open_events"].event(data)
-    print(f"[{event.timestamp / 1e9:.6f}] Process {event.comm.decode()} (PID: {event.pid}) opened {event.filename.decode()}")
-    sys_openat_counter.inc()
+    timestamp = event.timestamp / 1e9
+    
+    if event.ret < 0:  # Error case
+        sys_open_failed.inc()
+        key = (event.pid, event.filename.decode())
+        
+        # Anomaly detection logic
+        now = time.time()
+        record = failed_attempts[key]
+        
+        if now - record['first_ts'] > TIME_WINDOW:
+            # Reset counter for new time window
+            record.update({'count': 1, 'first_ts': now})
+        else:
+            record['count'] += 1
 
-def process_anomaly_event(cpu, data, size):
-    event = bpf["anomaly_events"].event(data)
-    print(f"ANOMALY DETECTED: PID {event.pid} ({event.comm.decode()}) opened {event.count} files in time window!")
-    anomaly_counter.inc()
+        if record['count'] >= FAILURE_THRESHOLD:
+            dt = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+            print(f"{dt} ANOMALY: PID {event.pid} failed to open "
+                  f"{event.filename.decode()} {record['count']} times!")
+            sudo_anomalies.set(1)
+            record['count'] = 0  # Reset after alerting
+    else:
+        sys_open_counter.inc()
+        print(f"[{timestamp:.6f}] Sudo child opened: {event.filename.decode()}")
 
-# Load eBPF program
-bpf_source = Path('ebpf-probe.c').read_text()
-bpf = BPF(text=bpf_source)
-
-# Configure filtering
-# Block PID 1 (init)
-blocked_pids = bpf["blocked_pids"]
-blocked_pids[ct.c_uint32(1)] = ct.c_uint8(1)
-
-# Block comm 'systemd'
-blocked_comms = bpf["blocked_comms"]
-key = comm_key()
-key.comm = b'systemd'.ljust(16, b'\x00')
-blocked_comms[key] = ct.c_uint8(1)
-
-# Configure anomaly detection
-config_map = bpf["config_map"]
-cfg = Config()
-cfg.window_ns = int(1e9)  # 1 second window
-cfg.threshold = 100        # 100 file opens
-config_map[ct.c_uint32(0)] = cfg
-
-# Set up perf buffers
-bpf["clone_events"].open_perf_buffer(process_clone_event)
-bpf["open_events"].open_perf_buffer(process_open_event)
-bpf["anomaly_events"].open_perf_buffer(process_anomaly_event)
-
-print("Monitoring sys_clone and file open events with filtering and anomaly detection...")
-
-try:
+if __name__ == "__main__":
+    start_http_server(3000)
+    bpf = BPF(text=Path('ebpf-probe.c').read_text())
+    bpf["clone_events"].open_perf_buffer(process_clone_event)
+    bpf["open_events"].open_perf_buffer(process_open_event)
+    
+    print("Monitoring sudo-related activity...")
     while True:
-        bpf.perf_buffer_poll()
-except KeyboardInterrupt:
-    print("\nMonitoring stopped")
+        try:
+            bpf.perf_buffer_poll()
+        except KeyboardInterrupt:
+            break
