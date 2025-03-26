@@ -4,7 +4,7 @@
 python3 -m venv venv
 #activate the venv
 source venv/bin/activate
-pip3 install -r requirement.txt
+pip3 install -r requirements.txt
 
 #Clang deps 
 sudo apt-get install bpfcc-tools libbpfcc-dev
